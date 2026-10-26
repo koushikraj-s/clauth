@@ -2488,6 +2488,16 @@ pub(crate) mod namespaced_keychain_ledger {
             dead_code,
             reason = "the only caller is the macOS copied-bearer re-point"
         )
+    /// created it itself (an MCP sign-in saves one) in a live session's own
+    /// runtime tree. ADOPTS it by recording the `(service, profile, session)`
+    /// row the session's seed would have, so the orphan GC collects it like
+    /// any seeded item once the session ends, and the session's own swap
+    /// legs ([`authorize_write`]) take the row over unchanged. A row that
+    /// exists by now is left as it is. Refused unless the caller's check
+    /// ([`super::mcp_sync_may_adopt`]) holds, and while a delete is in flight.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "the only caller is the macOS MCP login sync")
     )]
     pub(crate) fn authorize_live_write(
         runtime: &Path,
@@ -2497,6 +2507,9 @@ pub(crate) mod namespaced_keychain_ledger {
     ) -> Result<OwnedKeychainWrite> {
         anyhow::ensure!(
             super::session_item_may_adopt(runtime, session, background),
+    ) -> Result<OwnedKeychainWrite> {
+        anyhow::ensure!(
+            super::mcp_sync_may_adopt(runtime, session, false),
             "{} is not live session {session}'s own runtime tree",
             runtime.display()
         );
@@ -9555,8 +9568,8 @@ pub(crate) fn live_session_runtime_dirs() -> Vec<LiveRuntime> {
     not(target_os = "macos"),
     allow(dead_code, reason = "the only caller is the macOS MCP login sync")
 )]
-fn live_session_runtime_dirs() -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
+fn live_session_runtime_dirs() -> Vec<LiveRuntime> {
+    let mut out: Vec<LiveRuntime> = Vec::new();
     for row in crate::live_sessions::list() {
         if row.harness != crate::harness::Harness::Claude || !is_session_id(&row.session_id) {
             continue;
@@ -9586,7 +9599,12 @@ fn live_session_runtime_dirs() -> Vec<PathBuf> {
             });
             && !out.contains(&tree)
         {
-            out.push(tree);
+            out.push(LiveRuntime {
+                runtime: tree,
+                profile: probe,
+                session: row.session_id.clone(),
+                background: row.background,
+            });
         }
     }
     out
@@ -9722,6 +9740,38 @@ pub(crate) fn repoint_copied_bearers() {
             if !repoint_member_sessions(&member, &revoked, targets, deadline) {
                 note_revoked_rolling_bearer(&member, revoked);
             }
+/// One live session's runtime tree, with what adopting its per-session item
+/// would record: the member it is on and its session id.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "the only caller is the macOS MCP login sync")
+)]
+struct LiveRuntime {
+    runtime: PathBuf,
+    profile: ProfileName,
+    session: String,
+    background: bool,
+}
+
+/// Whether the MCP login sync may adopt the unowned per-session item of
+/// `runtime`: only a per-session tree (never the shared background pair)
+/// whose dir name carries exactly the live session's id `sid`. Anything
+/// else, a foreign `CLAUDE_CONFIG_DIR` among them (#81), is never adopted.
+/// PURE.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "the only caller is the macOS MCP login sync")
+)]
+pub(crate) fn mcp_sync_may_adopt(runtime: &Path, sid: &str, background: bool) -> bool {
+    !background
+        && is_session_id(sid)
+        && runtime
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(sid_of_runtime_dir_name)
+            .is_some_and(|own| own == sid)
+}
+
 /// The daemon tick's hook for the MCP login sync: at most one pass per
 /// [`MCP_SYNC_INTERVAL_MS`], never two at once, on a detached thread so the
 /// `security` subprocesses spend neither the tick's budget nor its watchdog
@@ -9855,18 +9905,20 @@ fn sync_mcp_logins_once() {
     let store_paths = crate::claude::mcp_carrier_store_paths();
     let mut sources = crate::claude::read_mcp_carrier_stores(&store_paths);
     let owned = namespaced_keychain_ledger::owned_services().unwrap_or_default();
-    let mut items: Vec<PathBuf> = Vec::new();
-    for runtime in live_session_runtime_dirs() {
-        let Ok(service) = crate::keychain::keychain_service_for_config_dir(&runtime) else {
+    let mut items: Vec<(LiveRuntime, bool)> = Vec::new();
+    for live in live_session_runtime_dirs() {
+        let Ok(service) = crate::keychain::keychain_service_for_config_dir(&live.runtime) else {
             continue;
         };
-        if !owned.contains(&service) {
-            continue;
-        }
-        // A locked keychain or an unreadable item sits this pass out.
-        if let Ok(Some(item)) = crate::keychain::read_config_dir_item(&runtime) {
+        // Read whether or not clauth owns it: Claude Code creates the item
+        // itself on an MCP sign-in, and that fresh login must count. A locked
+        // keychain or an unreadable item sits this pass out.
+        if let Ok(Some(item)) = crate::keychain::read_config_dir_item(&live.runtime) {
             sources.push(item);
-            items.push(runtime);
+            let is_owned = owned.contains(&service);
+            if is_owned || mcp_sync_may_adopt(&live.runtime, &live.session, live.background) {
+                items.push((live, is_owned));
+            }
         }
     }
     let winners = crate::claude::mcp_sync_winners(&sources);
@@ -9875,10 +9927,21 @@ fn sync_mcp_logins_once() {
     }
     let stores = crate::claude::sync_mcp_into_stores(&store_paths, &winners);
     let mut item_changes: Vec<(String, Vec<String>)> = Vec::new();
-    for runtime in items {
+    for (live, is_owned) in items {
+        let runtime = live.runtime;
         let outcome = owned_keychain_leg(
             KEYCHAIN_MIRROR_BUDGET,
-            || namespaced_keychain_ledger::authorize_owned_write(&runtime),
+            || {
+                if is_owned {
+                    namespaced_keychain_ledger::authorize_owned_write(&runtime)
+                } else {
+                    namespaced_keychain_ledger::authorize_live_write(
+                        &runtime,
+                        &live.profile,
+                        &live.session,
+                    )
+                }
+            },
             |owned| {
                 let servers =
                     crate::keychain::sync_mcp_into_config_dir_item(&runtime, owned, &winners)?;
