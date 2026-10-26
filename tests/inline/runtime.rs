@@ -19267,6 +19267,29 @@ fn a_background_sessions_item_is_adopted_on_its_own_tree() {
     let profile = crate::profile::ProfileName::from("acct");
     assert!(
         namespaced_keychain_ledger::authorize_live_write(&tree, &profile, "704-1", false).is_err()
+// ── MCP login sync: the daemon's leg ────────────────────────────────────────
+
+/// The sync's throttle: a first pass is always due, a later one only once the
+/// interval has passed.
+#[test]
+fn mcp_sync_runs_at_most_once_per_interval() {
+    assert!(mcp_sync_due(1_000, 0), "a first pass is due");
+    assert!(!mcp_sync_due(1_000 + MCP_SYNC_INTERVAL_MS - 1, 1_000));
+    assert!(mcp_sync_due(1_000 + MCP_SYNC_INTERVAL_MS, 1_000));
+    assert!(!mcp_sync_due(500, 1_000), "a clock step back is not due");
+}
+
+/// The daemon's sync writes only items a session already owns: no row, no
+/// witness, and the ledger is left untouched either way.
+#[test]
+fn mcp_sync_authorizes_only_an_item_a_session_owns() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".clauth/profiles/ledgered/runtime-701-1");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+
+    assert!(
+        namespaced_keychain_ledger::authorize_owned_write(&runtime).is_err(),
+        "an item no row names is the orphan GC's, never the sync's"
     );
     assert!(
         namespaced_keychain_ledger::load()
@@ -19294,4 +19317,20 @@ fn the_owned_witness_needs_a_row() {
     let runtime = home.home().join(".clauth/profiles/acct/runtime-705-1");
     fs::create_dir_all(&runtime).expect("runtime");
     assert!(namespaced_keychain_ledger::authorize_owned_write(&runtime).is_err());
+            .is_empty(),
+        "a refused authorization records nothing"
+    );
+
+    let profile = crate::profile::ProfileName::from("ledgered");
+    let session = SessionId::for_test("701-1");
+    let seeded = namespaced_keychain_ledger::authorize_write(&runtime, &profile, &session)
+        .expect("owning session's row");
+    let before = namespaced_keychain_ledger::load().expect("ledger").owners;
+    let owned = namespaced_keychain_ledger::authorize_owned_write(&runtime).expect("owned item");
+    assert_eq!(owned.service(), seeded.service());
+    assert_eq!(
+        namespaced_keychain_ledger::load().expect("ledger").owners,
+        before,
+        "the sync never rewrites the owning session's row"
+    );
 }
