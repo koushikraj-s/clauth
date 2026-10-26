@@ -1684,6 +1684,19 @@ pub(crate) fn repoint_config_dir_item_bearer(
     sidecar: &Path,
     member: &crate::profile::ProfileName,
 ) -> Result<bool> {
+/// Bring a live session's NAMESPACED item's MCP logins up to `winners`
+/// ([`crate::claude::mcp_sync_apply`]), for the daemon's MCP login sync.
+/// Returns the servers written; empty when nothing changed. The item is read
+/// immediately before the write and the winners merged into what it holds
+/// then, so a refresh Claude Code saved since the sync's first read is kept
+/// whenever it is at least as fresh. Only `mcpOAuth` changes; the login and
+/// every other key are written back as read. An absent item is never created:
+/// that session reads its file, which the store sync covers.
+pub(crate) fn sync_mcp_into_config_dir_item(
+    config_dir: &Path,
+    owned: &crate::runtime::namespaced_keychain_ledger::OwnedKeychainWrite,
+    winners: &serde_json::Map<String, Value>,
+) -> Result<Vec<String>> {
     let service = keychain_service_for_config_dir(config_dir)?;
     anyhow::ensure!(
         service == owned.service(),
@@ -1712,6 +1725,17 @@ pub(crate) fn repoint_config_dir_item_bearer(
 
 /// Whether a failed Keychain call failed on the classified locked-keychain
 /// transient, which a caller that retries later skips quietly.
+        return Ok(Vec::new());
+    };
+    let servers = crate::claude::mcp_sync_apply(&mut blob, winners);
+    if !servers.is_empty() {
+        put_blob_at(&service, &account, &blob)?;
+    }
+    Ok(servers)
+}
+
+/// Whether a failed Keychain call failed on the classified locked-keychain
+/// transient, which a periodic caller skips quietly and retries next time.
 pub(crate) fn failed_on_locked_keychain(e: &anyhow::Error) -> bool {
     !crate::claude::failed_read_degrades_to_delete(classified_exit(e))
 }
