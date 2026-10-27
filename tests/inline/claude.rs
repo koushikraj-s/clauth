@@ -7105,4 +7105,23 @@ fn a_copied_bearer_is_repointed_only_when_it_is_the_revoked_one() {
         assert!(!repoint_copied_bearer(&mut copy, "old", &live, now, false));
         assert_eq!(copy, garbage);
     }
+/// A store with a rotation staged beside it is skipped, as every other writer
+/// of `credentials.json` stands down for one; the next pass retries it.
+#[test]
+fn mcp_store_sync_stands_down_for_a_staged_rotation() {
+    let _home = HomeSandbox::new();
+    seed_mcp_accounts(&["mithra", "support"], None);
+    let staged = store_of("mithra").with_file_name("credentials.json.pending");
+    fs::write(&staged, "{}").expect("stage");
+    let fresh = with_mcp(serde_json::json!({ "atlassian": mcp("fresh", Some(500)) }));
+    let winners = mcp_sync_winners([&fresh]);
+    let changed = sync_mcp_into_stores(&[store_of("mithra"), store_of("support")], &winners);
+    assert_eq!(changed.len(), 1, "only the unstaged store: {changed:?}");
+    assert_eq!(
+        read_value(&store_of("mithra"))["mcpOAuth"]["atlassian"]["accessToken"],
+        "stale"
+    );
+    fs::remove_file(&staged).expect("unstage");
+    let changed = sync_mcp_into_stores(&[store_of("mithra")], &winners);
+    assert_eq!(changed.len(), 1, "the next pass retries it");
 }
