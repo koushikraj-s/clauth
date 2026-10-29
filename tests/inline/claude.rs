@@ -7105,6 +7105,8 @@ fn a_copied_bearer_is_repointed_only_when_it_is_the_revoked_one() {
         assert!(!repoint_copied_bearer(&mut copy, "old", &live, now, false));
         assert_eq!(copy, garbage);
     }
+}
+
 /// A store with a rotation staged beside it is skipped, as every other writer
 /// of `credentials.json` stands down for one; the next pass retries it.
 #[test]

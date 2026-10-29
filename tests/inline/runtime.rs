@@ -16892,9 +16892,8 @@ fn no_item_leg_folds_in_a_carry_or_a_flock() {
         }
     }
     assert_eq!(
-        calls, 7,
-        "the swap's item write and sign-out, the convergence's sign-out, the seed's write and sign-out, the seed's retry and the copied-bearer re-point each call `owned_keychain_leg` once"
-        "the swap's item write and sign-out, the convergence's sign-out, the seed's write and sign-out, the seed's retry and the MCP login sync's item write each call `owned_keychain_leg` once"
+        calls, 8,
+        "the swap's item write and sign-out, the convergence's sign-out, the seed's write and sign-out, the seed's retry, the copied-bearer re-point and the MCP login sync's item write each call `owned_keychain_leg` once"
     );
     assert!(
         offenders.is_empty(),
@@ -19268,6 +19267,35 @@ fn a_background_sessions_item_is_adopted_on_its_own_tree() {
     let profile = crate::profile::ProfileName::from("acct");
     assert!(
         namespaced_keychain_ledger::authorize_live_write(&tree, &profile, "704-1", false).is_err()
+    );
+    assert!(
+        namespaced_keychain_ledger::load()
+            .expect("ledger")
+            .owners
+            .is_empty()
+    );
+    let owned = namespaced_keychain_ledger::authorize_live_write(&tree, &profile, "704-1", true)
+        .expect("adopted");
+    assert_eq!(
+        namespaced_keychain_ledger::load().expect("ledger").owners,
+        vec![namespaced_keychain_ledger::Owner {
+            service: owned.service().to_string(),
+            profile,
+            session: "704-1".to_string(),
+        }]
+    );
+    namespaced_keychain_ledger::authorize_owned_write(&tree).expect("owned now");
+}
+
+/// An item the ledger does not name refuses the owned witness.
+#[test]
+fn the_owned_witness_needs_a_row() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".clauth/profiles/acct/runtime-705-1");
+    fs::create_dir_all(&runtime).expect("runtime");
+    assert!(namespaced_keychain_ledger::authorize_owned_write(&runtime).is_err());
+}
+
 // ── MCP login sync: the daemon's leg ────────────────────────────────────────
 
 /// The sync's throttle: a first pass is always due, a later one only once the
@@ -19296,28 +19324,6 @@ fn mcp_sync_authorizes_only_an_item_a_session_owns() {
         namespaced_keychain_ledger::load()
             .expect("ledger")
             .owners
-            .is_empty()
-    );
-    let owned = namespaced_keychain_ledger::authorize_live_write(&tree, &profile, "704-1", true)
-        .expect("adopted");
-    assert_eq!(
-        namespaced_keychain_ledger::load().expect("ledger").owners,
-        vec![namespaced_keychain_ledger::Owner {
-            service: owned.service().to_string(),
-            profile,
-            session: "704-1".to_string(),
-        }]
-    );
-    namespaced_keychain_ledger::authorize_owned_write(&tree).expect("owned now");
-}
-
-/// An item the ledger does not name refuses the owned witness.
-#[test]
-fn the_owned_witness_needs_a_row() {
-    let home = HomeSandbox::new();
-    let runtime = home.home().join(".clauth/profiles/acct/runtime-705-1");
-    fs::create_dir_all(&runtime).expect("runtime");
-    assert!(namespaced_keychain_ledger::authorize_owned_write(&runtime).is_err());
             .is_empty(),
         "a refused authorization records nothing"
     );
@@ -19336,46 +19342,6 @@ fn the_owned_witness_needs_a_row() {
     );
 }
 
-/// Only a live session's own per-session tree is adoptable: the dir name must
-/// carry exactly that session's id, never the background pair, never a dir
-/// clauth did not build.
-#[test]
-fn mcp_sync_adopts_only_a_live_sessions_own_tree() {
-    let root = Path::new("/h/.clauth/profiles/acct");
-    assert!(mcp_sync_may_adopt(
-        &root.join("runtime-34181-0"),
-        "34181-0",
-        false
-    ));
-    assert!(mcp_sync_may_adopt(
-        &root.join("runtime-isolated-34181-0"),
-        "34181-0",
-        false
-    ));
-    assert!(!mcp_sync_may_adopt(
-        &root.join("runtime-34181-1"),
-        "34181-0",
-        false
-    ));
-    assert!(!mcp_sync_may_adopt(
-        &root.join("runtime-bg"),
-        "34181-0",
-        true
-    ));
-    assert!(!mcp_sync_may_adopt(
-        &root.join("runtime-34181-0"),
-        "34181-0",
-        true
-    ));
-    assert!(!mcp_sync_may_adopt(
-        Path::new("/work/my-claude"),
-        "34181-0",
-        false
-    ));
-    assert!(!mcp_sync_may_adopt(&root.join("runtime"), "34181-0", false));
-    assert!(!mcp_sync_may_adopt(&root.join("runtime-x"), "x", false));
-}
-
 /// An unowned item of a live session's own tree is adopted: the row the seed
 /// would have written is recorded, an existing row is left as it is, a dir
 /// that is not that session's is refused with nothing recorded, and a delete
@@ -19389,8 +19355,14 @@ fn mcp_sync_adopts_an_unowned_live_item_once() {
 
     let foreign = home.home().join("my-claude");
     fs::create_dir_all(&foreign).expect("foreign dir");
-    assert!(namespaced_keychain_ledger::authorize_live_write(&foreign, &profile, "702-1").is_err());
-    assert!(namespaced_keychain_ledger::authorize_live_write(&runtime, &profile, "702-2").is_err());
+    assert!(
+        namespaced_keychain_ledger::authorize_live_write(&foreign, &profile, "702-1", false)
+            .is_err()
+    );
+    assert!(
+        namespaced_keychain_ledger::authorize_live_write(&runtime, &profile, "702-2", false)
+            .is_err()
+    );
     assert!(
         namespaced_keychain_ledger::load()
             .expect("ledger")
@@ -19398,8 +19370,9 @@ fn mcp_sync_adopts_an_unowned_live_item_once() {
             .is_empty()
     );
 
-    let owned = namespaced_keychain_ledger::authorize_live_write(&runtime, &profile, "702-1")
-        .expect("adopted");
+    let owned =
+        namespaced_keychain_ledger::authorize_live_write(&runtime, &profile, "702-1", false)
+            .expect("adopted");
     let owners = namespaced_keychain_ledger::load().expect("ledger").owners;
     assert_eq!(
         owners,
@@ -19415,6 +19388,7 @@ fn mcp_sync_adopts_an_unowned_live_item_once() {
         &runtime,
         &crate::profile::ProfileName::from("other"),
         "702-1",
+        false,
     )
     .expect("again");
     assert_eq!(
@@ -19434,7 +19408,9 @@ fn mcp_sync_adopts_an_unowned_live_item_once() {
     let _in_flight =
         with_state_lock(|_held| namespaced_keychain_ledger::record_in_flight_locked(&service))
             .expect("stamp");
-    assert!(namespaced_keychain_ledger::authorize_live_write(&other, &profile, "702-3").is_err());
+    assert!(
+        namespaced_keychain_ledger::authorize_live_write(&other, &profile, "702-3", false).is_err()
+    );
 }
 
 /// The sync reads every live session's `.credentials.json` and the global one

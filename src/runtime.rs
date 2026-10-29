@@ -2447,15 +2447,6 @@ pub(crate) mod namespaced_keychain_ledger {
             dead_code,
             reason = "the only caller is the macOS copied-bearer re-point"
         )
-    /// Mint the write witness for a per-session item ANOTHER process owns, for
-    /// the daemon's MCP login sync: only when the ledger already holds a row
-    /// for the item `runtime` derives, and no sweep's delete of it is in
-    /// flight, checked in one state-lock hold. The row is left exactly as it
-    /// is: the sync writes beside the owning session's login, it never takes
-    /// the item over, and an item nobody owns is the orphan GC's, never this.
-    #[cfg_attr(
-        not(target_os = "macos"),
-        allow(dead_code, reason = "the only caller is the macOS MCP login sync")
     )]
     pub(crate) fn authorize_owned_write(runtime: &Path) -> Result<OwnedKeychainWrite> {
         let service = crate::claude::namespaced_keychain_service(
@@ -2488,16 +2479,6 @@ pub(crate) mod namespaced_keychain_ledger {
             dead_code,
             reason = "the only caller is the macOS copied-bearer re-point"
         )
-    /// created it itself (an MCP sign-in saves one) in a live session's own
-    /// runtime tree. ADOPTS it by recording the `(service, profile, session)`
-    /// row the session's seed would have, so the orphan GC collects it like
-    /// any seeded item once the session ends, and the session's own swap
-    /// legs ([`authorize_write`]) take the row over unchanged. A row that
-    /// exists by now is left as it is. Refused unless the caller's check
-    /// ([`super::mcp_sync_may_adopt`]) holds, and while a delete is in flight.
-    #[cfg_attr(
-        not(target_os = "macos"),
-        allow(dead_code, reason = "the only caller is the macOS MCP login sync")
     )]
     pub(crate) fn authorize_live_write(
         runtime: &Path,
@@ -2507,9 +2488,6 @@ pub(crate) mod namespaced_keychain_ledger {
     ) -> Result<OwnedKeychainWrite> {
         anyhow::ensure!(
             super::session_item_may_adopt(runtime, session, background),
-    ) -> Result<OwnedKeychainWrite> {
-        anyhow::ensure!(
-            super::mcp_sync_may_adopt(runtime, session, false),
             "{} is not live session {session}'s own runtime tree",
             runtime.display()
         );
@@ -9526,20 +9504,6 @@ pub(crate) struct LiveRuntime {
     pub(crate) profile: ProfileName,
     pub(crate) session: String,
     pub(crate) background: bool,
-/// How often the daemon's MCP login sync runs at most. Each pass reads every
-/// live session's per-session Keychain item (a `security` subprocess apiece),
-/// so it does not run on every one-second tick; a login made in one session
-/// reaches the others within this window.
-const MCP_SYNC_INTERVAL_MS: u64 = 15_000;
-
-static MCP_SYNC_IN_FLIGHT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static MCP_SYNC_LAST_MS: AtomicU64 = AtomicU64::new(0);
-
-/// Whether an MCP login sync pass is due at `now_ms` after one that started
-/// at `last_ms` (`0`: never). PURE.
-pub(crate) fn mcp_sync_due(now_ms: u64, last_ms: u64) -> bool {
-    last_ms == 0 || now_ms.saturating_sub(last_ms) >= MCP_SYNC_INTERVAL_MS
 }
 
 /// The runtime trees of every live `clauth start` session (and background
@@ -9557,18 +9521,12 @@ pub(crate) fn mcp_sync_due(now_ms: u64, last_ms: u64) -> bool {
 )]
 pub(crate) fn live_session_runtime_dirs() -> Vec<LiveRuntime> {
     let mut out: Vec<LiveRuntime> = Vec::new();
-/// items the MCP login sync may touch. A row is live by the same probe the
-/// tally uses (`current_member` first, then `start_profile`); its tree must
-/// exist. Items of sessions that are not live are the orphan GC's, never this.
-fn live_session_runtime_dirs() -> Vec<LiveRuntime> {
-    let mut out: Vec<LiveRuntime> = Vec::new();
     for row in crate::live_sessions::list() {
         if row.harness != crate::harness::Harness::Claude || !is_session_id(&row.session_id) {
             continue;
         }
         let member = row.current_member.as_deref().unwrap_or(&row.start_profile);
         let probe = ProfileName::from(member);
-        let probe = ProfileName::from(row.current_member.as_deref().unwrap_or(&row.start_profile));
         if !session_row_is_live(&probe, row.isolated, &row.session_id) {
             continue;
         }
@@ -9582,14 +9540,6 @@ fn live_session_runtime_dirs() -> Vec<LiveRuntime> {
         };
         if let Some(tree) = tree.filter(|tree| tree.is_dir())
             && !out.iter().any(|live| live.runtime == tree)
-        {
-            out.push(LiveRuntime {
-                runtime: tree,
-                profile: probe,
-                session: row.session_id.clone(),
-                background: row.background,
-            });
-            && !out.contains(&tree)
         {
             out.push(LiveRuntime {
                 runtime: tree,
@@ -9732,82 +9682,7 @@ pub(crate) fn repoint_copied_bearers() {
             if !repoint_member_sessions(&member, &revoked, targets, deadline) {
                 note_revoked_rolling_bearer(&member, revoked);
             }
-/// The live credential files the MCP login sync reads as sources (and never
-/// writes): each live session's `<runtime>/.credentials.json` and the global
-/// `~/.claude/.credentials.json`. A symlink into a store is read through; the
-/// read skips anything absent or unparseable.
-fn mcp_sync_live_files(live: &[LiveRuntime]) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = live
-        .iter()
-        .map(|l| l.runtime.join(".credentials.json"))
-        .collect();
-    if let Ok(global) = crate::claude::claude_credentials_path() {
-        files.push(global);
-    }
-    files
-}
-
-/// One live session's runtime tree, with what adopting its per-session item
-/// would record: the member it is on and its session id.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(
-        dead_code,
-        reason = "the adoption fields are read only by the macOS per-session item legs"
-    )
-)]
-struct LiveRuntime {
-    runtime: PathBuf,
-    profile: ProfileName,
-    session: String,
-    background: bool,
-}
-
-/// Whether the MCP login sync may adopt the unowned per-session item of
-/// `runtime`: only a per-session tree (never the shared background pair)
-/// whose dir name carries exactly the live session's id `sid`. Anything
-/// else, a foreign `CLAUDE_CONFIG_DIR` among them (#81), is never adopted.
-/// PURE.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(dead_code, reason = "the only caller is the macOS MCP login sync")
-)]
-pub(crate) fn mcp_sync_may_adopt(runtime: &Path, sid: &str, background: bool) -> bool {
-    !background
-        && is_session_id(sid)
-        && runtime
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(sid_of_runtime_dir_name)
-            .is_some_and(|own| own == sid)
-}
-
-/// The daemon tick's hook for the MCP login sync: at most one pass per
-/// [`MCP_SYNC_INTERVAL_MS`], never two at once, on a detached thread so the
-/// pass spends neither the tick's budget nor its watchdog window. Runs on
-/// every platform (the item legs inside are macOS-only); a no-op in test
-/// builds, which must never reach the real stores or Keychain.
-pub(crate) fn sync_mcp_logins_detached() {
-    use std::sync::atomic::Ordering as O;
-    if cfg!(test) {
-        return;
-    }
-    let now = crate::usage::now_ms();
-    if !mcp_sync_due(now, MCP_SYNC_LAST_MS.load(O::Relaxed)) {
-        return;
-    }
-    if MCP_SYNC_IN_FLIGHT.swap(true, O::AcqRel) {
-        return;
-    }
-    MCP_SYNC_LAST_MS.store(now, O::Relaxed);
-    let spawned = std::thread::Builder::new()
-        .name("clauth-mcp-sync".into())
-        .spawn(|| {
-            sync_mcp_logins_once();
-            MCP_SYNC_IN_FLIGHT.store(false, O::Release);
-        });
-    if spawned.is_err() {
-        MCP_SYNC_IN_FLIGHT.store(false, O::Release);
+        }
     }
 }
 
@@ -9896,6 +9771,68 @@ fn repoint_member_sessions(
         }
     }
     true
+}
+
+/// How often the daemon's MCP login sync runs at most. Each pass reads every
+/// live session's per-session Keychain item (a `security` subprocess apiece),
+/// so it does not run on every one-second tick; a login made in one session
+/// reaches the others within this window.
+const MCP_SYNC_INTERVAL_MS: u64 = 15_000;
+
+static MCP_SYNC_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static MCP_SYNC_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether an MCP login sync pass is due at `now_ms` after one that started
+/// at `last_ms` (`0`: never). PURE.
+pub(crate) fn mcp_sync_due(now_ms: u64, last_ms: u64) -> bool {
+    last_ms == 0 || now_ms.saturating_sub(last_ms) >= MCP_SYNC_INTERVAL_MS
+}
+
+/// The live credential files the MCP login sync reads as sources (and never
+/// writes): each live session's `<runtime>/.credentials.json` and the global
+/// `~/.claude/.credentials.json`. A symlink into a store is read through; the
+/// read skips anything absent or unparseable.
+fn mcp_sync_live_files(live: &[LiveRuntime]) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = live
+        .iter()
+        .map(|l| l.runtime.join(".credentials.json"))
+        .collect();
+    if let Ok(global) = crate::claude::claude_credentials_path() {
+        files.push(global);
+    }
+    files
+}
+
+/// The daemon tick's hook for the MCP login sync: at most one pass per
+/// [`MCP_SYNC_INTERVAL_MS`], never two at once, on a detached thread so the
+/// pass spends neither the tick's budget nor its watchdog window. Runs on
+/// every platform (the item legs inside are macOS-only); a no-op in test
+/// builds, which must never reach the real stores or Keychain.
+pub(crate) fn sync_mcp_logins_detached() {
+    use std::sync::atomic::Ordering as O;
+    if cfg!(test) {
+        return;
+    }
+    let now = crate::usage::now_ms();
+    if !mcp_sync_due(now, MCP_SYNC_LAST_MS.load(O::Relaxed)) {
+        return;
+    }
+    if MCP_SYNC_IN_FLIGHT.swap(true, O::AcqRel) {
+        return;
+    }
+    MCP_SYNC_LAST_MS.store(now, O::Relaxed);
+    let spawned = std::thread::Builder::new()
+        .name("clauth-mcp-sync".into())
+        .spawn(|| {
+            sync_mcp_logins_once();
+            MCP_SYNC_IN_FLIGHT.store(false, O::Release);
+        });
+    if spawned.is_err() {
+        MCP_SYNC_IN_FLIGHT.store(false, O::Release);
+    }
+}
+
 /// One MCP login sync pass: collect `mcpOAuth` from every account's carrier
 /// store, every live session's `.credentials.json` and the global one (read
 /// only, [`mcp_sync_live_files`]) and, on macOS, every live session's
@@ -9936,7 +9873,7 @@ fn sync_mcp_logins_once() {
 /// macOS: read every live session's per-session Keychain item into `sources`,
 /// whether or not clauth owns it (Claude Code creates the item itself on an
 /// MCP sign-in, and that fresh login must count), and return the items the
-/// sync may write: owned ones, and unowned ones [`mcp_sync_may_adopt`] allows.
+/// sync may write: owned ones, and unowned ones [`session_item_may_adopt`] allows.
 /// A locked keychain or an unreadable item sits this pass out.
 #[cfg(target_os = "macos")]
 fn mcp_sync_item_sources(sources: &mut Vec<serde_json::Value>) -> Vec<(LiveRuntime, bool)> {
@@ -9952,7 +9889,7 @@ fn mcp_sync_item_sources(sources: &mut Vec<serde_json::Value>) -> Vec<(LiveRunti
         if let Ok(Some(item)) = crate::keychain::read_config_dir_item(&live.runtime) {
             sources.push(item);
             let is_owned = owned.contains(&service);
-            if is_owned || mcp_sync_may_adopt(&live.runtime, &live.session, live.background) {
+            if is_owned || session_item_may_adopt(&live.runtime, &live.session, live.background) {
                 items.push((live, is_owned));
             }
         }
@@ -9983,6 +9920,7 @@ fn mcp_sync_items(
                         &runtime,
                         &live.profile,
                         &live.session,
+                        live.background,
                     )
                 }
             },
